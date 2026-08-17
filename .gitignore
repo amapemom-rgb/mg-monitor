@@ -1,0 +1,11 @@
+local-collector/config.py
+local-collector/tovary.csv
+local-collector/last_run.txt
+local-collector/run.log
+local-collector/wrapper.log
+local-collector/launchd.out.log
+local-collector/launchd.err.log
+local-collector/collector_result.json
+local-collector/__pycache__/
+local-collector/venv/
+*.pyc
