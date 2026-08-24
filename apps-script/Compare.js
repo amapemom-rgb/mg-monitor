@@ -140,7 +140,7 @@ function calcSpread(points, isPercentMetric) {
 function num_(v) {
   if (v === null || v === undefined || v === '') return NaN;
   if (typeof v === 'number') return v;
-  var s = String(v).replace(/ /g, '').replace(/\s/g, '')
+  var s = String(v).replace(/\u00A0/g, '').replace(/\s/g, '')
     .replace(/₽|руб\.?|%/gi, '').replace(',', '.');
   var n = parseFloat(s);
   return isNaN(n) ? NaN : n;
@@ -204,14 +204,9 @@ function buildSpreadMessage(type, name, metric, cur, cfg, extra) {
 
   var lines = cur.points.map(function (p) {
     var mark = p.mp === cur.minMp ? ' ← дешевле всех' : (p.mp === cur.maxMp ? ' ← дороже всех' : '');
-    return '• ' + p.mp + ': ' + fv(p.val) + mark;
+    return fv(p.val) + ' • ' + p.mp + mark;
   });
-  var tail = 'Разница ' + gap + ' (' + spread + '), дешевле всех — ' + cur.minMp + ' ' + fv(cur.min) +
-             ', дороже всех — ' + cur.maxMp + ' ' + fv(cur.max) + '. Медиана ' + fv(cur.median) + '.';
-  if (cur.outlier)
-    tail += '\nВыбивается: ' + cur.outlier.mp + ' (' + (cur.outlier.dev > 0 ? '+' : '') +
-            fp_(cur.outlier.dev) + '% к медиане).';
-  return head + '\n' + lines.join('\n') + '\n' + tail;
+  return head + '\n' + lines.join('\n');
 }
 
 /* ==================================================================== */
@@ -710,7 +705,7 @@ function parsePriceFromHtml_(html) {
   var ok = function (n) { return !isNaN(n) && n >= 50 && n <= 1000000; };
   var t = String(html)
     .replace(/&nbsp;|&#160;|&#xA0;|&thinsp;|&#8201;|&#x2009;|&#8239;/gi, ' ')
-    .replace(/ | | /g, ' ');
+    .replace(/\u00A0|\u202F|\u2009/g, ' ');
 
   var m;
 
@@ -1657,7 +1652,7 @@ function buildInstructionSheet() {
     ['B', '10. КЛЮЧИ'],
     ['T', 'Все токены только в Script Properties (Apps Script → Project Settings). В ячейках и в коде их нет.'],
     ['T', 'TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, OZON_CLIENT_ID, OZON_API_KEY, WB_API_KEY, YANDEX_TOKEN, SCRAPINGBEE_API_KEY.'],
-    ['T', 'ID группы: см. Script Properties. Бот настраивается через @BotFather.'],
+    ['T', 'ID группы: -5527977119 (обязательно с минусом). Бот: @mg_monitor_price_bot.'],
     ['T', 'Если группу превратят в супергруппу, ID станет вида -100… — скрипт подхватит его сам и запишет в Script Properties.'],
     ['T', ''],
 
