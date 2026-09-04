@@ -90,9 +90,23 @@ def wb_wallet_price_from_text(txt):
 
 
 def ga_from_html(html):
+    # Устаревший способ: Золотое Яблоко перестало заполнять микроразметку —
+    # itemprop="price" теперь отдаёт "0". Оставлен как запасной вариант.
     m = re.findall(r'itemprop=["\']price["\'][^>]*content=["\']([0-9.]+)["\']', html)
     vals = [float(x) for x in m if float(x) >= 50]
     return min(vals) if vals else None
+
+
+def ga_price_from_text(txt):
+    # Актуальная цена — первая на странице; за ней идёт зачёркнутая старая
+    # и сумма платежа в рассрочку (она меньше, поэтому min() брать нельзя).
+    # Пример: "4 299 ₽ | 5 243 ₽ | со скидкой -18% при авторизации | от 1 074 ₽".
+    txt = _normalize_spaces(txt)
+    for x in re.findall(r'(\d[\d ]{2,8})\s*₽', txt):
+        digits = re.sub(r' ', '', x)
+        if digits.isdigit() and float(digits) >= 50:
+            return float(digits)
+    return None
 
 
 def ym_price_from_text(txt):
@@ -284,6 +298,7 @@ def stop_chrome(proc):
 def collect():
     products = load_products()
     results = {}
+    wb_authorized = None  # проверяется один раз на первой карточке WB
 
     for p in products:
         results[p['name']] = {
@@ -338,17 +353,21 @@ def collect():
                         page.goto(url, wait_until="load", timeout=45000)
                         page.wait_for_timeout(7000)
                         wb_body = page.inner_text("body")
-                        wb_val = wb_wallet_price_from_text(wb_body)
-                        if wb_val is None:
-                            # Лучше пусто, чем неверно: обычная цена выше реальной
-                            # примерно на 1%, и записывать её как "цену для
-                            # покупателя" нельзя — это и была исходная ошибка.
-                            print(f"WB {p['name']}: ЦЕНА С КОШЕЛЬКОМ НЕ НАЙДЕНА "
-                                  f"(обычная на странице: {wb_price_from_text(wb_body)}) — "
-                                  f"скорее всего слетела сессия WB, нужно войти в профиль",
-                                  flush=True)
+                        # У залогиненного пользователя WB сразу показывает первой
+                        # цену с Кошельком (проверено: 3 459 ₽ = факт), причём
+                        # слова "Кошелёк" на странице нет — поэтому берём первую
+                        # цену, а помеченную используем только если она вдруг
+                        # найдётся. Если сессия слетит, WB покажет цену примерно
+                        # на 1% выше — это ловится проверкой авторизации ниже.
+                        wb_val = wb_wallet_price_from_text(wb_body) or wb_price_from_text(wb_body)
                         results[p['name']]['wb_site'] = wb_val
                         print(f"WB {p['name']}: {wb_val}", flush=True)
+                        if wb_authorized is None:
+                            wb_authorized = "Войти" not in wb_body[:2500]
+                            if not wb_authorized:
+                                print("WB: ВНИМАНИЕ, сессия не авторизована — цены будут "
+                                      "примерно на 1% выше реальных (без Кошелька). "
+                                      "Нужно войти: bash open_profile.sh", flush=True)
                     except Exception as e:
                         print(f"WB {p['name']}: ОШИБКА {e}", flush=True)
 
@@ -356,9 +375,12 @@ def collect():
                     try:
                         page.goto(p['ga_url'], wait_until="domcontentloaded", timeout=45000)
                         page.wait_for_timeout(6000)
-                        results[p['name']]['ga_site'] = ga_from_html(page.content())
-                    except Exception:
-                        pass
+                        ga_val = (ga_price_from_text(page.inner_text("body"))
+                                  or ga_from_html(page.content()))
+                        results[p['name']]['ga_site'] = ga_val
+                        print(f"GA {p['name']}: {ga_val}", flush=True)
+                    except Exception as e:
+                        print(f"GA {p['name']}: ОШИБКА {e}", flush=True)
 
                 if p['letu_url']:
                     results[p['name']]['letu_site'] = goto_title_price(p['letu_url'], wait_ms=9000)
