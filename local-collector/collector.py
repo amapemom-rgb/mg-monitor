@@ -4,13 +4,14 @@ from playwright.sync_api import sync_playwright
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-# ВНИМАНИЕ: профиль браузера сознательно оставлен в /tmp — здесь уже сохранены
-# рабочие логины (Ozon Seller, Yandex ID/Partner Market, подтверждение 18+).
-# Правда в том, что /tmp может быть очищен macOS между перезагрузками — тогда
-# логины слетят и понадобится один раз войти заново вручную (см. README,
-# раздел "Известные ошибки и меры предосторожности"). Если хотите более
-# надёжное решение, перенесите PROFILE_DIR в постоянную папку и войдите заново.
-PROFILE_DIR = "/tmp/mg_chrome_profile"
+# Профиль браузера ОБЯЗАТЕЛЬНО должен лежать в постоянной папке.
+# Раньше он был в /tmp — macOS очистила её при перезагрузке, вместе с ней
+# слетели все сессии (WB, Ozon Seller, Yandex Partner) и подтверждение 18+.
+# Последствия были незаметными и потому опасными: кабинеты стали писать
+# "сессия не авторизована", карточка Ozon стала отдавать заглушку 18+, а WB
+# перестал показывать цену с Кошельком — но в таблице при этом продолжали
+# висеть старые цены, выглядевшие правдоподобно. Не переносите в /tmp снова.
+PROFILE_DIR = os.path.join(BASE_DIR, "chrome_profile")
 CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 CDP_PORT = 9333
 
@@ -46,7 +47,7 @@ def price_from_title(title):
 
 def _normalize_spaces(txt):
     # Разные площадки используют разные "тонкие" юникодные пробелы как разделитель
-    # разрядов (\xa0 и т.п.), и набор может отличаться от
+    # разрядов (\xa0,  ,  ,   и т.п.), и набор может отличаться от
     # загрузки к загрузке (эксперименты/AB-тесты на стороне площадки) — поэтому
     # перечислять конкретные символы в классе регулярки ненадёжно (уже дважды
     # ловили баг, когда очередной незнакомый пробел обрубал число). Вместо этого
@@ -69,6 +70,23 @@ def wb_price_from_text(txt):
         return None
     digits = re.sub(r' ', '', m.group(1))
     return float(digits) if digits.isdigit() else None
+
+
+def wb_wallet_price_from_text(txt):
+    # Цена с WB Кошельком (та, которую покупатель реально платит) показывается
+    # только залогиненному пользователю и подписана словом "Кошелёк" рядом.
+    # Если сессия слетела, WB отдаёт обычную цену — она примерно на 1% выше,
+    # и раньше сборщик молча писал именно её (факт 3459 ₽ vs собрано 3494 ₽).
+    # Поэтому ищем цену прицельно рядом со словом "Кошел", а не первую попавшуюся.
+    txt = _normalize_spaces(txt)
+    for m in re.finditer(r'Кошел', txt):
+        window = txt[max(0, m.start() - 80):m.start()]
+        prices = re.findall(r'(\d[\d ]{2,8})\s*₽', window)
+        if prices:
+            digits = re.sub(r' ', '', prices[-1])
+            if digits.isdigit():
+                return float(digits)
+    return None
 
 
 def ga_from_html(html):
@@ -102,8 +120,9 @@ YM_CAB_URL = "https://partner.market.yandex.ru/business/YOUR_BUSINESS_ID/prices?
 def ym_cab_prices_from_text(txt):
     # Партнёрский кабинет Яндекс.Маркета: список товаров, у каждого строка вида
     # "<sku>•<категория>", а через несколько строк — "Ваша цена" и сама цена.
-    # sku — это ваш offer_id/артикул в нижнем регистре, сопоставленный с
-    # названиями товаров в tovary.csv.
+    # sku (например "lilu", "rose", "noir", "aqua", "duos", "mini") совпадает
+    # с нашими названиями товаров в нижнем регистре — TEDY PINK там нет вообще
+    # (у неё нет карточки на Яндексе, см. пустую "Yandex Ссылка" в tovary.csv).
     txt = _normalize_spaces(txt)
     lines = [l.strip() for l in txt.split("\n")]
     out = {}
@@ -133,9 +152,9 @@ def ozon_prices_for_offer(text, offer_id):
     # [2] "Цена для покупателя" — раньше считали, что это и есть цена на сайте,
     #     но выяснилось, что это поле в кабинете может отставать от реальной
     #     цены на публичной карточке товара (Ozon добавляет свои промо/скидки
-    #     поверх цены продавца) — см. README, раздел "Известные ошибки".
-    #     Поэтому этот индекс больше НЕ используем для Ozon Сайт — только для
-    #     Ozon Кабинет.
+    #     поверх цены продавца) — см. чат: кабинет показывал 1916₽, а на самой
+    #     карточке товара реально было 2183₽. Поэтому этот индекс больше НЕ
+    #     используем для Ozon Сайт — только для Ozon Кабинет.
     lines = text.split("\n")
     try:
         idx = lines.index(offer_id)
@@ -168,6 +187,28 @@ def ozon_site_price_from_text(txt):
             if v >= 50:
                 return v
     return None
+
+
+def confirm_ozon_age(page, birthdate="01011990"):
+    # Заглушка 18+ на карточках Ozon. Кликать мышью нельзя: поверх лежит баннер
+    # кук и перехватывает клики (force-клик уводит на страницу политики).
+    # Поэтому фокусируем настоящий <input> внутри маскированного поля через JS,
+    # печатаем дату с клавиатуры (чтобы отработала маска) и жмём кнопку тоже
+    # через JS — баннер кук при этом не трогаем.
+    page.evaluate("""() => {
+        const d = document.querySelector('[name=birthdate]');
+        const inp = d && d.querySelector('input');
+        if (inp) { inp.focus(); inp.click(); }
+    }""")
+    page.keyboard.type(birthdate, delay=80)
+    page.wait_for_timeout(500)
+    page.evaluate("""() => {
+        const b = Array.from(document.querySelectorAll('button'))
+            .find(x => (x.innerText || '').trim() === 'Подтвердить');
+        if (b) b.click();
+    }""")
+    page.wait_for_timeout(6000)
+    print("Ozon: подтвердил 18+", flush=True)
 
 
 def load_products(csv_path=None):
@@ -296,7 +337,16 @@ def collect():
                     try:
                         page.goto(url, wait_until="load", timeout=45000)
                         page.wait_for_timeout(7000)
-                        wb_val = wb_price_from_text(page.inner_text("body"))
+                        wb_body = page.inner_text("body")
+                        wb_val = wb_wallet_price_from_text(wb_body)
+                        if wb_val is None:
+                            # Лучше пусто, чем неверно: обычная цена выше реальной
+                            # примерно на 1%, и записывать её как "цену для
+                            # покупателя" нельзя — это и была исходная ошибка.
+                            print(f"WB {p['name']}: ЦЕНА С КОШЕЛЬКОМ НЕ НАЙДЕНА "
+                                  f"(обычная на странице: {wb_price_from_text(wb_body)}) — "
+                                  f"скорее всего слетела сессия WB, нужно войти в профиль",
+                                  flush=True)
                         results[p['name']]['wb_site'] = wb_val
                         print(f"WB {p['name']}: {wb_val}", flush=True)
                     except Exception as e:
@@ -333,7 +383,8 @@ def collect():
                     # Публичная карточка товара — надёжнее, чем поле "Цена для
                     # покупателя" в кабинете продавца: выяснилось, что кабинет
                     # может отставать от реальной цены на сайте (Ozon добавляет
-                    # свои промо поверх цены продавца), см. README.
+                    # свои промо поверх цены продавца), см. чат — TEDY PINK:
+                    # кабинет 1916₽, а на самой карточке реально 2183₽.
                     ozon_ok = False
                     for _ in range(3):
                         try:
@@ -344,6 +395,15 @@ def collect():
                             page.wait_for_timeout(3000)
                     if ozon_ok:
                         page.wait_for_timeout(6000)
+                        # Ozon показывает заглушку "Подтвердите возраст" (18+), пока
+                        # в профиле нет соответствующей куки. На заглушке нет ни цен,
+                        # ни описания — страница весит ~500 символов, и парсер молча
+                        # возвращал None. Подтверждаем возраст один раз и продолжаем.
+                        try:
+                            if "Подтвердите возраст" in page.inner_text("body"):
+                                confirm_ozon_age(page)
+                        except Exception as e:
+                            print("Ozon: не удалось пройти заглушку 18+:", e, flush=True)
                         oz_val = ozon_site_price_from_text(page.inner_text("body"))
                         results[p['name']]['ozon_site'] = oz_val
                         print(f"Ozon сайт {p['name']}: {oz_val}", flush=True)

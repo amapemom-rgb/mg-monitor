@@ -120,6 +120,15 @@ def main():
     r1 = call_appscript(token, {'secret': SECRET, 'updates': updates})
     log(f'Ответ записи: {r1}')
 
+    # Явно и громко сообщаем, какие цены собрать не удалось. Раньше такие
+    # случаи были не видны вообще: ячейка просто сохраняла вчерашнее значение.
+    try:
+        miss = (r1.get('result') or {}).get('missing') or []
+    except AttributeError:
+        miss = []
+    if miss:
+        log('ВНИМАНИЕ, не собрано (ячейки очищены): ' + '; '.join(miss))
+
     log('Запускаю облачный анализ (Летуаль и остальное + статусы + история)')
     r2 = call_appscript(token, {'secret': SECRET, 'action': 'run_analysis'}, timeout=180)
     log(f'Ответ анализа: {r2}')

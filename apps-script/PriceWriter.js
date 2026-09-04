@@ -221,6 +221,7 @@ function writeSitePrices_(updates) {
   var nameCol = col['Название'];
   var now = new Date();
   var log = [];
+  var missing = [];
 
   for (var r = 1; r < values.length; r++) {
     var name = String(values[r][nameCol] || '').trim();
@@ -228,12 +229,26 @@ function writeSitePrices_(updates) {
     if (!upd) continue;
 
     var changed = false;
+    var missingHere = [];
     Object.keys(fieldMap).forEach(function (key) {
       var colName = fieldMap[key];
       var ci = col[colName];
       if (ci === undefined) return;
       var v = upd[key];
-      if (v === null || v === undefined) return;
+
+      // Раньше здесь стоял простой `return` — если цену собрать не удалось,
+      // ячейку не трогали, и в таблице продолжала висеть цена прошлых дней.
+      // Внешне она выглядела свежей (колонка "Обновлено" обновлялась), поэтому
+      // поломка парсера могла жить неделями незамеченной — именно так и вышло
+      // с Ozon Сайт и обоими кабинетами. Теперь несобранная цена очищается:
+      // пустая ячейка честно означает "сегодня собрать не удалось".
+      if (v === null || v === undefined || v === '') {
+        if (String(sh.getRange(r + 1, ci + 1).getValue()) !== '') {
+          sh.getRange(r + 1, ci + 1).clearContent();
+        }
+        missingHere.push(colName);
+        return;
+      }
       sh.getRange(r + 1, ci + 1).setValue(v);
       changed = true;
     });
@@ -242,7 +257,8 @@ function writeSitePrices_(updates) {
       sh.getRange(r + 1, updatedCol + 1).setValue(now);
     }
     if (changed) log.push(name);
+    if (missingHere.length) missing.push(name + ': ' + missingHere.join(', '));
   }
 
-  return log;
+  return {updated: log, missing: missing};
 }
