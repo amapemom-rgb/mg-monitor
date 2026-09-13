@@ -33,6 +33,45 @@ STATE_FILE = os.path.join(BASE_DIR, 'last_run.txt')
 LOG_FILE = os.path.join(BASE_DIR, 'run.log')
 PRODUCTS_CSV = os.path.join(BASE_DIR, 'tovary.csv')
 
+# Какой колонке в tovary.csv соответствует каждая площадка. Нужно, чтобы
+# отличать настоящий сбой от "товара там просто нет": у TEDY PINK нет карточки
+# на Яндекс Маркете, у MINI — на GoldApple и Летуали. Ссылка пустая, собирать
+# нечего, и в отчёт о несобранном это попадать не должно — иначе живая ошибка
+# теряется среди строк, которые будут повторяться каждый день вечно.
+MISSING_SOURCE_COL = {
+    'WB Сайт': 'WB Артикул',
+    'Бренд-сайт Цена': 'Бренд-сайт Ссылка',
+    'GoldApple Сайт': 'GoldApple Ссылка',
+    'Letual Сайт': 'Letual Ссылка',
+    'Yandex Сайт': 'Yandex Ссылка',
+    'Yandex Кабинет': 'Yandex Ссылка',
+    'Ozon Сайт': 'Ozon Ссылка',
+    'Ozon Кабинет': 'Ozon Ссылка',
+}
+
+
+def filter_real_misses(miss):
+    """Оставляет только то, что действительно не собралось: ссылка есть, а цены нет."""
+    try:
+        with open(PRODUCTS_CSV, newline='', encoding='utf-8') as f:
+            by_name = {(r.get('Название') or '').strip(): r for r in csv.DictReader(f)}
+    except OSError:
+        return miss  # не смогли прочитать список — лучше показать всё, чем скрыть лишнее
+    out = []
+    for item in miss:
+        name, _, cols = item.partition(':')
+        name = name.strip()
+        row = by_name.get(name)
+        real = []
+        for c in [c.strip() for c in cols.split(',') if c.strip()]:
+            src = MISSING_SOURCE_COL.get(c)
+            if src and row is not None and not str(row.get(src) or '').strip():
+                continue
+            real.append(c)
+        if real:
+            out.append(f'{name}: {", ".join(real)}')
+    return out
+
 
 def log(msg):
     line = f'[{datetime.now().isoformat(timespec="seconds")}] {msg}'
@@ -126,6 +165,7 @@ def main():
         miss = (r1.get('result') or {}).get('missing') or []
     except AttributeError:
         miss = []
+    miss = filter_real_misses(miss)
     if miss:
         log('ВНИМАНИЕ, не собрано (ячейки очищены): ' + '; '.join(miss))
 
