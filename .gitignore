@@ -9,3 +9,11 @@ local-collector/collector_result.json
 local-collector/__pycache__/
 local-collector/venv/
 *.pyc
+
+# рабочие файлы сборщика
+debug/
+region.json
+cenniki-*.txt
+collector_partial.json
+apps-script-pulled/
+push_gas.py

@@ -73,6 +73,77 @@ def filter_real_misses(miss):
     return out
 
 
+MONTHS_RU = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+             'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
+
+# Те же соответствия, что и выше, но для ключей, которыми оперирует сборщик.
+# Нужны, чтобы считать «собрано X из Y», где Y — только те цены, которые
+# в принципе могли собраться: у товара заполнена ссылка на площадку.
+FIELD_SOURCE_COL = {
+    'wb_site': 'WB Артикул',
+    'brand_site': 'Бренд-сайт Ссылка',
+    'ga_site': 'GoldApple Ссылка',
+    'letu_site': 'Letual Ссылка',
+    'yandex_site': 'Yandex Ссылка',
+    'yandex_cab': 'Yandex Ссылка',
+    'ozon_site': 'Ozon Ссылка',
+    'ozon_cab': 'Ozon Ссылка',
+}
+
+
+def count_prices(results):
+    try:
+        with open(PRODUCTS_CSV, newline='', encoding='utf-8') as f:
+            by_name = {(r.get('Название') or '').strip(): r for r in csv.DictReader(f)}
+    except OSError:
+        return None, None
+    got = expected = 0
+    for name, vals in results.items():
+        row = by_name.get(name) or {}
+        for key, src in FIELD_SOURCE_COL.items():
+            if not str(row.get(src) or '').strip():
+                continue
+            expected += 1
+            if vals.get(key) is not None:
+                got += 1
+    return got, expected
+
+
+def build_summary(results, miss, seconds, jumps=(), regions=()):
+    now = datetime.now()
+    head = f'MG-MONITOR · {now.day} {MONTHS_RU[now.month - 1]}'
+    mins = round(seconds / 60)
+    dur = 'меньше минуты' if mins < 1 else f'{mins} мин'
+    got, expected = count_prices(results)
+    line = f'Собрано {got} из {expected} цен · {dur}' if expected else f'Сбор завершён · {dur}'
+    text = f'{head}\n{line}'
+    if miss:
+        # Двоеточие из отчёта апскрипта меняем на тире: в сообщении это список,
+        # а не пары «ключ: значение», и тире читается спокойнее.
+        rows = '\n'.join(m.replace(':', ' —', 1) for m in miss)
+        text += f'\n\nНе собрано:\n{rows}'
+    if jumps:
+        # Отдельным блоком и ниже несобранного: это не отказ, а повод взглянуть.
+        rows = '\n'.join(j.replace(':', ' —', 1) for j in jumps)
+        text += f'\n\nЦена изменилась резко:\n{rows}'
+    if regions:
+        # Ставим первым по важности после заголовка не получится — блок идёт
+        # последним, но смена региона означает, что все цифры выше собраны
+        # в другом городе, поэтому формулировка прямая.
+        text += '\n\nВНИМАНИЕ, сменился регион:\n' + '\n'.join(regions)
+    return text
+
+
+def send_summary(token, text):
+    # Сводка не должна ронять сбор: если Telegram недоступен, просто пишем в лог.
+    try:
+        r = call_appscript(token, {'secret': SECRET, 'action': 'notify', 'text': text}, timeout=60)
+        if not r.get('ok'):
+            log(f'Сводку в Telegram отправить не удалось: {r}')
+    except Exception as e:
+        log(f'Сводку в Telegram отправить не удалось: {e}')
+
+
 def log(msg):
     line = f'[{datetime.now().isoformat(timespec="seconds")}] {msg}'
     print(line, flush=True)
@@ -135,8 +206,46 @@ def export_products_csv(token):
     log(f'tovary.csv обновлён: {len(r["rows"])} товаров')
 
 
+def log_run_row(token, results, miss, seconds, status='ок'):
+    # Строка в лист «Диагностика». Как и сводка, это необязательная часть:
+    # если записать не удалось, сбор уже сделан и ронять его из-за отчёта нельзя.
+    now = datetime.now()
+    got, expected = count_prices(results) if results else (0, 0)
+    row = {
+        'date': now.strftime('%d.%m.%Y'),
+        'time': now.strftime('%H:%M'),
+        'minutes': round(seconds / 60),
+        'got': got or 0,
+        'expected': expected or 0,
+        'missing': '; '.join(miss) if miss else '',
+        'status': status,
+    }
+    try:
+        r = call_appscript(token, {'secret': SECRET, 'action': 'log_run', 'row': row}, timeout=60)
+        if not r.get('ok'):
+            log(f'Строку в «Диагностику» записать не удалось: {r}')
+    except Exception as e:
+        log(f'Строку в «Диагностику» записать не удалось: {e}')
+
+
 def main():
+    started = datetime.now()
     token = get_access_token()
+    try:
+        run_once(token, started)
+    except Exception as e:
+        # Прогон упал на полпути — всё равно оставляем след и в «Диагностике»,
+        # и в Telegram. Иначе день молча выпадает из истории, как 12 сентября,
+        # и заметить пропажу можно только случайно, открыв таблицу.
+        secs = (datetime.now() - started).total_seconds()
+        log_run_row(token, {}, [str(e)[:300]], secs, status='сбой')
+        now = datetime.now()
+        send_summary(token, f'MG-MONITOR · {now.day} {MONTHS_RU[now.month - 1]}\n'
+                            f'Сбор не выполнен\n{str(e)[:300]}')
+        raise
+
+
+def run_once(token, started):
 
     log('Обновляю список товаров (tovary.csv) из таблицы')
     export_products_csv(token)
@@ -169,6 +278,13 @@ def main():
     if miss:
         log('ВНИМАНИЕ, не собрано (ячейки очищены): ' + '; '.join(miss))
 
+    try:
+        jumps = (r1.get('result') or {}).get('jumps') or []
+    except AttributeError:
+        jumps = []
+    if jumps:
+        log('ВНИМАНИЕ, цена изменилась резко: ' + '; '.join(jumps))
+
     log('Запускаю облачный анализ (Летуаль и остальное + статусы + история)')
     r2 = call_appscript(token, {'secret': SECRET, 'action': 'run_analysis'}, timeout=180)
     log(f'Ответ анализа: {r2}')
@@ -180,6 +296,16 @@ def main():
     with open(STATE_FILE, 'w') as f:
         f.write(date.today().isoformat())
     log('Готово, отметка о запуске сохранена: ' + date.today().isoformat())
+
+    region_warns = list(getattr(collector, 'REGION_WARNINGS', []) or [])
+    if region_warns:
+        log('ВНИМАНИЕ, сменился регион: ' + '; '.join(region_warns))
+
+    summary = build_summary(results, miss, (datetime.now() - started).total_seconds(),
+                            jumps, region_warns)
+    log('Сводка в Telegram:\n' + summary)
+    send_summary(token, summary)
+    log_run_row(token, results, miss, (datetime.now() - started).total_seconds())
 
 
 if __name__ == '__main__':

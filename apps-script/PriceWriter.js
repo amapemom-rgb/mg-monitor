@@ -84,6 +84,34 @@ function doPost(e) {
       return ContentService.createTextOutput(JSON.stringify({ok: true, result: ares}))
         .setMimeType(ContentService.MimeType.JSON);
     }
+    if (body.action === 'rebuild_instruction') {
+      buildInstructionSheet();
+      return ContentService.createTextOutput(JSON.stringify({ok: true, result: 'instruction rebuilt'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    if (body.action === 'install_stale_guard') {
+      return ContentService.createTextOutput(JSON.stringify({ok: true, result: installStaleGuard()}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    if (body.action === 'run_stale_guard') {
+      return ContentService.createTextOutput(JSON.stringify({ok: true, result: staleGuard()}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    if (body.action === 'log_run') {
+      logRun_(body.row || {});
+      return ContentService.createTextOutput(JSON.stringify({ok: true, result: 'logged'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    if (body.action === 'notify') {
+      // Сводку о прогоне составляет локальный сборщик — только он знает,
+      // сколько времени занял сбор и что не собралось. Отправляет облако,
+      // чтобы токен бота жил в одном месте (Script Properties) и не появлялся
+      // копией на Маке. tgSend_ лежит в Compare.js: он, в отличие от простой
+      // отправки, переживает смену ID группы на супергрупповой.
+      tgSend_(String(body.text || ''));
+      return ContentService.createTextOutput(JSON.stringify({ok: true, result: 'sent'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
     if (body.action === 'set_product_and_refresh') {
       var dashSh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Дашборд');
       dashSh.getRange('B4').setValue(body.name || '');
@@ -195,6 +223,138 @@ function doPost(e) {
 }
 
 
+// Сколько дней молчания считать поводом для сообщения. Разные пороги потому,
+// что причины разные: молчащий Мак — это выключенный ноутбук или упавший
+// запуск (замечать надо быстро), а площадка без свежей цены — чаще временный
+// сбой парсера, и дёргать из-за одного пропущенного дня незачем.
+var STALE_LOCAL_DAYS_ = 2;
+var STALE_MP_DAYS_ = 3;
+
+
+function staleGuard() {
+  // Сторож застоявшихся данных. Существующий dailyGuard в Compare.js следит
+  // только за облачным сбором и повторяет его при неудаче — но площадки,
+  // которые собирает Мак (Ozon, Летуаль, GoldApple, Яндекс, сайт бренда),
+  // для него не считаются сбоем, иначе он слал бы ложные тревоги каждую ночь.
+  // Из-за этого выключенный на неделю Мак или слетевшая сессия в кабинете
+  // проходили совершенно незаметно. Этот сторож смотрит с другой стороны:
+  // не «удался ли запуск», а «когда по этим данным последний раз была свежая
+  // цена» — и потому ловит тихие поломки независимо от того, кто собирает.
+  var props = PropertiesService.getScriptProperties();
+  var today = new Date();
+  var problems = [], keys = [];
+
+  var last = props.getProperty('LAST_LOCAL_RUN');
+  if (last) {
+    var dl = daysSince_(new Date(last + 'T12:00:00'), today);
+    if (dl >= STALE_LOCAL_DAYS_) {
+      problems.push('Локальный сборщик молчит ' + dl + ' дн., последний прогон ' + last);
+      keys.push('local');
+    }
+  }
+
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('История');
+  if (sh && sh.getLastRow() > 1) {
+    var vals = sh.getRange(2, 1, sh.getLastRow() - 1, 4).getValues();
+    var lastByMp = {};
+    for (var i = 0; i < vals.length; i++) {
+      var d = vals[i][0], mp = String(vals[i][2] || '').trim(), price = vals[i][3];
+      if (!mp || !(d instanceof Date)) continue;
+      if (typeof price !== 'number' || !(price > 0)) continue;
+      if (!lastByMp[mp] || d > lastByMp[mp]) lastByMp[mp] = d;
+    }
+    Object.keys(lastByMp).sort().forEach(function (mp) {
+      var days = daysSince_(lastByMp[mp], today);
+      if (days >= STALE_MP_DAYS_) {
+        problems.push(mp + ' — ' + days + ' дн. без свежей цены');
+        keys.push(mp);
+      }
+    });
+  }
+
+  if (!problems.length) {
+    props.deleteProperty('STALE_ALERTED');
+    return 'всё свежее';
+  }
+
+  // Подпись состояния — только из названий, без числа дней. Иначе счётчик
+  // растёт каждые сутки, подпись меняется, и одна и та же нерешённая проблема
+  // присылала бы новое сообщение каждый день. Молчим, пока состав не изменится.
+  var sign = keys.sort().join('|');
+  if (props.getProperty('STALE_ALERTED') === sign) return 'уже сообщали';
+  props.setProperty('STALE_ALERTED', sign);
+  tgSend_('MG-MONITOR · сторож\nДанные перестали обновляться:\n' + problems.join('\n'));
+  return 'отправлено: ' + problems.join('; ');
+}
+
+
+function daysSince_(d, now) {
+  return Math.floor((now.getTime() - d.getTime()) / 86400000);
+}
+
+
+function installStaleGuard() {
+  // Отдельный триггер, не через installSchedule() из Compare.js: тот при каждом
+  // вызове сносит триггеры по своему списку имён, и staleGuard в него не входит,
+  // так что этот триггер переживает перенастройку расписания.
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'staleGuard') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('staleGuard').timeBased().atHour(16).nearMinute(0).everyDays(1).create();
+  return 'сторож застоявшихся данных: проверка ежедневно в 16:00';
+}
+
+
+// На сколько цена должна отличиться от прошлого сбора, чтобы про неё сообщили.
+// Треть выбрана намеренно: обычные акции маркетплейсов дают 10–20% и сообщать
+// о них незачем, а подмена числа парсером обычно в разы. 15.09 цена ROSE на
+// Ozon уехала с 3393 ₽ на 827 ₽ — такое этот порог ловит с запасом.
+var JUMP_THRESHOLD_ = 0.33;
+
+
+function logRun_(row) {
+  // Лист «Диагностика»: по строке на каждый запуск сбора. Нужен, чтобы историю
+  // запусков было видно прямо в таблице, без терминала и логов на Маке —
+  // и чтобы закономерности («WB отваливается по понедельникам») бросались
+  // в глаза сами, а не находились перебором задним числом.
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName('Диагностика');
+  if (!sh) {
+    sh = ss.insertSheet('Диагностика');
+    sh.appendRow(['Дата', 'Время', 'Мин', 'Собрано', 'Возможно было', 'Не собрано', 'Итог']);
+    sh.getRange(1, 1, 1, 7)
+      .setFontWeight('bold').setBackground('#f1f3f4').setVerticalAlignment('middle');
+    sh.setFrozenRows(1);
+    [90, 70, 50, 80, 110, 360, 90].forEach(function (w, i) { sh.setColumnWidth(i + 1, w); });
+  }
+
+  var ok = String(row.status || '') !== 'сбой';
+  // Отметка для сторожа: свежая дата ставится только после удавшегося прогона,
+  // поэтому неделя падений выглядит для него так же, как выключенный Мак.
+  if (ok) {
+    PropertiesService.getScriptProperties().setProperty('LAST_LOCAL_RUN',
+      Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd'));
+  }
+  sh.appendRow([
+    String(row.date || ''), String(row.time || ''), Number(row.minutes || 0),
+    Number(row.got || 0), Number(row.expected || 0),
+    String(row.missing || ''), ok ? 'ОК' : 'сбой'
+  ]);
+
+  var r = sh.getLastRow();
+  // Приглушённая заливка итога: зелёная — всё собралось, жёлтая — собралось
+  // не всё, красная — прогон вообще не дошёл до конца. Без ярких цветов,
+  // чтобы лист читался как таблица, а не как светофор.
+  var full = ok && Number(row.got || 0) >= Number(row.expected || 0);
+  sh.getRange(r, 7).setBackground(!ok ? '#f4cccc' : (full ? '#d9ead3' : '#fff2cc'));
+  sh.getRange(r, 6).setFontColor('#666666');
+
+  // Держим последние 200 запусков — это больше полугода ежедневных прогонов.
+  var keep = 200;
+  if (sh.getLastRow() > keep + 1) sh.deleteRows(2, sh.getLastRow() - keep - 1);
+}
+
+
 function writeSitePrices_(updates) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var sh = ss.getSheetByName('Товары');
@@ -222,6 +382,7 @@ function writeSitePrices_(updates) {
   var now = new Date();
   var log = [];
   var missing = [];
+  var jumps = [];
 
   for (var r = 1; r < values.length; r++) {
     var name = String(values[r][nameCol] || '').trim();
@@ -249,6 +410,14 @@ function writeSitePrices_(updates) {
         missingHere.push(colName);
         return;
       }
+      // Сверяем с тем, что стояло в ячейке до записи, — это цена прошлого сбора.
+      // Цену всё равно записываем: резкий скачок бывает и настоящим (акция,
+      // распродажа). Но молча он больше не проходит.
+      var prev = sh.getRange(r + 1, ci + 1).getValue();
+      if (typeof prev === 'number' && prev > 0 &&
+          Math.abs(v - prev) / prev > JUMP_THRESHOLD_) {
+        jumps.push(name + ': ' + colName + ' ' + Math.round(prev) + ' → ' + Math.round(v));
+      }
       sh.getRange(r + 1, ci + 1).setValue(v);
       changed = true;
     });
@@ -260,5 +429,5 @@ function writeSitePrices_(updates) {
     if (missingHere.length) missing.push(name + ': ' + missingHere.join(', '));
   }
 
-  return {updated: log, missing: missing};
+  return {updated: log, missing: missing, jumps: jumps};
 }
